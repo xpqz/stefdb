@@ -1,5 +1,6 @@
 {
     "compilerOptions": {
+        "outDir": "./dist",
         "allowJs": true,
         "target": "es2017",
         "noFallthroughCasesInSwitch": true,
@@ -9,6 +10,10 @@
         "noImplicitThis": true,
         "forceConsistentCasingInFileNames": true,
         "module": "commonjs",
-        "moduleResolution": "node"
-    }
+        "moduleResolution": "node",
+        "sourceMap": true
+    },
+    "include": [
+        "./src/**/*"
+    ]
 }

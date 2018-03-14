@@ -29,6 +29,6 @@
     "typescript-tools": "^0.3.1"
   },
   "scripts": {
-    "test": "mocha -r ts-node/register **/*.spec.ts"
+    "test": "mocha --no-timeouts"
   }
 }
