@@ -20,7 +20,7 @@ interface Revisions {
     ids: string[];
 }
 
-interface OpenRevs {
+interface Leaves {
     open_revs: string[];
 }
 
@@ -60,7 +60,7 @@ export class StefDB {
     private db: any;
     private readonly prefix = {
         doc: 'doc',
-        tree: 'tree',
+        revs: 'revs',
         leaves: 'leaves'
     };
 
@@ -69,15 +69,15 @@ export class StefDB {
     }
 
     private async winner(id: string): Promise<string> {
-        let revs: OpenRevs;
+        let leaves: Leaves;
         try {
-            revs = await this.openRevs(id);
+            leaves = await this.openRevs(id);
         } catch(err) {
             throw new Error(`[winner] No open revs found for ${id}`);
         }
 
         // Sort on gen first, then lexicographically on rev.
-        revs.open_revs.sort((a, b): number => {
+        leaves.open_revs.sort((a, b): number => {
             const [gen1s, rev1] = a.split('-');
             const [gen2s, rev2] = b.split('-');
 
@@ -99,7 +99,7 @@ export class StefDB {
             return 1
         });
 
-        return revs.open_revs[0];
+        return leaves.open_revs[0];
     }
 
     /**
@@ -111,7 +111,7 @@ export class StefDB {
     private async update(doc: Document): Promise<BulkOperation[]> {
         const parentRev = doc._rev;
         const parentDocKey = makeKey(this.prefix.doc, doc._id, parentRev);
-        const parentTreeKey = makeKey(this.prefix.tree, doc._id, parentRev);
+        const parentTreeKey = makeKey(this.prefix.revs, doc._id, parentRev);
         let node: Node;
         try {
             node = JSON.parse(await this.db.get(parentDocKey));
@@ -134,7 +134,7 @@ export class StefDB {
 
         // Store new rev
         const newRevKey = makeKey(this.prefix.doc, doc._id, newRev);
-        const newRevTreeKey = makeKey(this.prefix.tree, doc._id, newRev);
+        const newRevTreeKey = makeKey(this.prefix.revs, doc._id, newRev);
         let ops: BulkOperation[] = [{
             type: 'put',
             key: newRevKey,
@@ -173,7 +173,7 @@ export class StefDB {
         });
 
         // Open revs -- remove parent, add new
-        let leaves: OpenRevs;
+        let leaves: Leaves;
         try {
             leaves = await this.openRevs(doc._id);
         } catch (err) {
@@ -199,7 +199,11 @@ export class StefDB {
     }
 
     /**
-     * Generate the ops required for a new document create.
+     * Generate the ops required for a new document create:
+     *
+     * 1. Store the new document revision itself
+     * 2. Update the document revisions list
+     * 3. Update the list of open leaves
      *
      * @param doc A new document, or an existing document replicated in
      *            from a different database.
@@ -208,6 +212,7 @@ export class StefDB {
         if (newEdits) {
             doc._rev = makeRev(1, doc);
         }
+        // 1. Store doc itself
         const docKey = makeKey(this.prefix.doc, doc._id, doc._rev);
         let ops: BulkOperation[] = [{
             type: 'put',
@@ -218,9 +223,10 @@ export class StefDB {
             })
         }];
 
+        // 2. Update the document revisions list
         const [genS, hash] = doc._rev.split('-');
-        const treeKey = makeKey(this.prefix.tree, doc._id, doc._rev)
-        let revs: OpenRevs = { open_revs: [doc._rev] };
+        const treeKey = makeKey(this.prefix.revs, doc._id, doc._rev)
+        let leaves: Leaves = { open_revs: [doc._rev] };
         if (newEdits) {
             ops.push({
                 type: 'put',
@@ -240,19 +246,19 @@ export class StefDB {
                 })
             });
 
-            let current: OpenRevs;
+            let currentLeaves: Leaves;
             try {
-                current = await this.openRevs(doc._id);
+                currentLeaves = await this.openRevs(doc._id);
             } catch (err) {
                 throw err;
             }
-            revs.open_revs = revs.open_revs.concat(current.open_revs);
+            leaves.open_revs = leaves.open_revs.concat(currentLeaves.open_revs);
         }
 
         ops.push({
             type: 'put',
             key:  makePrefixedKey(this.prefix.leaves, doc._id),
-            value: JSON.stringify(revs)
+            value: JSON.stringify(leaves)
         });
 
         return ops;
@@ -366,7 +372,7 @@ export class StefDB {
         }
     }
 
-    public async openRevs(id: string): Promise<OpenRevs> {
+    public async openRevs(id: string): Promise<Leaves> {
         const key = makePrefixedKey(this.prefix.leaves, id);
         try {
             return JSON.parse(await this.db.get(key));
@@ -375,8 +381,8 @@ export class StefDB {
         }
     }
 
-    public async getRevisions(meta: DocumentMeta): Promise<Ancestor> {
-        const key = makeKey(this.prefix.tree, meta.id, meta.rev);
+    public async getRevisions(meta: DocumentMeta): Promise<Revisions> {
+        const key = makeKey(this.prefix.revs, meta.id, meta.rev);
         try {
             return JSON.parse(await this.db.get(key));
         } catch (err) {
