@@ -163,7 +163,12 @@ export class StefDB {
         } catch(err) {
             throw err;
         }
-        ops.push(this.storeRevsOperation(doc._id, newRev, parentGen+1, [newRev].concat(revs.ids)));
+        ops.push(this.storeRevsOperation(
+            doc._id,
+            newRev,
+            parentGen+1,
+            [newRev].concat(revs.ids)
+        ));
 
         // Leaves list -- remove parent, add new rev
         let leaves: Leaves;
@@ -226,18 +231,8 @@ export class StefDB {
     }
 
     /**
-     * Four cases:
-     *   1. { "foo": "baz" }
-     *      New document. Generate id and 1-gen rev. Key must not exist.
-     *   2. { "_id": ..., "bar": "baz" }
-     *      New document with a specified id. Generate 1-gen rev. Key
-     *      must not exist.
-     *   3. { "_id": ..., "_rev": ..., "bar": "baz" }
-     *      New revision. Check that {_id, _rev} is a leaf. New rev gen+1
-     *   4. { "_id": ..., "_rev": ..., "_deleted": true }
-     *      New tombstone. Check that {_id, _rev} is a leaf. New rev gen+1
-     *
      * @param doc document to be written to the database
+     * @param newEdits true for normal operation, false for replicator mode
      */
     private async generateBulkOperation(doc: Document, newEdits: boolean): Promise<BulkOperation[]> {
         let docClone = Object.assign({}, doc);
@@ -345,7 +340,7 @@ export class StefDB {
         try {
             return JSON.parse(await this.db.get(docKey));
         } catch (err) {
-            throw new Error(`[getNode] key not found: {id:${id}, rev:${rev}}`);
+            throw new Error(`[getNode] no node found for {id:${id}, rev:${rev}}`);
         }
     }
 
@@ -354,7 +349,7 @@ export class StefDB {
         try {
             return JSON.parse(await this.db.get(key));
         } catch (err) {
-            throw new Error(`[getLeaves] key not found: ${id}`);
+            throw new Error(`[getLeaves] no leaves found for id ${id}`);
         }
     }
 
@@ -363,7 +358,7 @@ export class StefDB {
         try {
             return JSON.parse(await this.db.get(key));
         } catch (err) {
-            throw new Error(`[getRevisions] No tree structure found for {id:${id}, rev:${rev}}`);
+            throw new Error(`[getRevisions] No revisions found for {id:${id}, rev:${rev}}`);
         }
     }
 }
