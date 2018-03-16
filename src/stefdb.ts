@@ -71,7 +71,7 @@ export class StefDB {
     private async winner(id: string): Promise<string> {
         let leaves: Leaves;
         try {
-            leaves = await this.openRevs(id);
+            leaves = await this.getLeaves(id);
         } catch(err) {
             throw new Error(`[winner] No open revs found for ${id}`);
         }
@@ -102,6 +102,30 @@ export class StefDB {
         return leaves.open_revs[0];
     }
 
+    private storeDocOperation(id: string, rev: string, doc: Document | null): BulkOperation {
+        return {
+            type: 'put',
+            key: makeKey(this.prefix.doc, id, rev),
+            value: JSON.stringify({leaf: doc !== null, body: doc})
+        };
+    }
+
+    private storeRevsOperation(id: string, rev: string, gen: number, ids: string[]): BulkOperation {
+        return {
+            type: 'put',
+            key: makeKey(this.prefix.revs, id, rev),
+            value: JSON.stringify({start: gen, ids: ids})
+        };
+    }
+
+    private storeLeavesOperation(id: string, leaves: Leaves): BulkOperation {
+        return {
+            type: 'put',
+            key: makePrefixedKey(this.prefix.leaves, id),
+            value: JSON.stringify(leaves)
+        };
+    }
+
     /**
      * Generate the ops required for a document update.
      *
@@ -110,20 +134,14 @@ export class StefDB {
      */
     private async update(doc: Document): Promise<BulkOperation[]> {
         const parentRev = doc._rev;
-        const parentDocKey = makeKey(this.prefix.doc, doc._id, parentRev);
-        const parentTreeKey = makeKey(this.prefix.revs, doc._id, parentRev);
-        let node: Node;
+
         try {
-            node = JSON.parse(await this.db.get(parentDocKey));
-        } catch(err) {
-            throw new Error(`[update] no such document: ${parentDocKey}`);
+            if (!await this.isLeaf(doc._id, parentRev)) {
+                throw new Error("[update] document update conflict");
+            }
+        } catch (err) {
+            throw err;
         }
-
-        if (!node.leaf) {
-            throw new Error("[update] document update conflict");
-        }
-
-        // console.log(`Updating rev: ${parentRev}`);
 
         // We're a leaf. Generate next-gen rev id for the update.
         const parentGen = parseInt(parentRev.split('-')[0]);
@@ -132,68 +150,38 @@ export class StefDB {
 
         // console.log(`New rev: ${newRev}`);
 
-        // Store new rev
-        const newRevKey = makeKey(this.prefix.doc, doc._id, newRev);
-        const newRevTreeKey = makeKey(this.prefix.revs, doc._id, newRev);
-        let ops: BulkOperation[] = [{
-            type: 'put',
-            key: newRevKey,
-            value: JSON.stringify({
-                parent: parentDocKey,
-                leaf: true,
-                body: doc
-            })
-        }];
-
-        // Parent is no longer a leaf, and body is no longer needed
-        ops.push({
-            type: 'put',
-            key: parentDocKey,
-            value: JSON.stringify({
-                leaf: false,
-                body: null
-            })
-        });
+        // Store new rev, and update parent to no longer be a leaf
+        let ops = [
+            this.storeDocOperation(doc._id, newRev, doc),
+            this.storeDocOperation(doc._id, parentRev, null)
+        ];
 
         // Ancestry relation
         let revs: Revisions;
         try {
-            revs = JSON.parse(await this.db.get(parentTreeKey));
+            revs = await this.getRevisions(doc._id, parentRev);
         } catch(err) {
-            throw new Error(`[update] No tree structure found for ${parentTreeKey}`);
+            throw err;
         }
+        ops.push(this.storeRevsOperation(doc._id, newRev, parentGen+1, [newRev].concat(revs.ids)));
 
-        ops.push({
-            type: 'put',
-            key: newRevTreeKey,
-            value: JSON.stringify({
-                start: parentGen+1,
-                ids: [newRev].concat(revs.ids)
-            })
-        });
-
-        // Open revs -- remove parent, add new
+        // Leaves list -- remove parent, add new rev
         let leaves: Leaves;
         try {
-            leaves = await this.openRevs(doc._id);
+            leaves = await this.getLeaves(doc._id);
         } catch (err) {
-            throw new Error(`[update] No open revs found for ${doc._id}`);
+            throw err;
         }
 
-        const openRevsKey = makePrefixedKey(this.prefix.leaves, doc._id);
         const index = leaves.open_revs.indexOf(parentRev);
         if (index > -1) {
             leaves.open_revs.splice(index, 1);
         } else {
-            throw new Error(`[update] Parent ${parentRev} not in open revisions for key: ${openRevsKey}`);
+            throw new Error(`[update] Parent ${parentRev} not in open revisions for id: ${doc._id}`);
         }
         leaves.open_revs.push(newRev);
 
-        ops.push({
-            type: 'put',
-            key: openRevsKey,
-            value: JSON.stringify(leaves)
-        });
+        ops.push(this.storeLeavesOperation(doc._id, leaves));
 
         return ops;
     }
@@ -212,54 +200,27 @@ export class StefDB {
         if (newEdits) {
             doc._rev = makeRev(1, doc);
         }
-        // 1. Store doc itself
-        const docKey = makeKey(this.prefix.doc, doc._id, doc._rev);
-        let ops: BulkOperation[] = [{
-            type: 'put',
-            key: docKey,
-            value: JSON.stringify({
-                leaf: true,
-                body: doc
-            })
-        }];
+
+       // Store new document revision
+       let ops = [ this.storeDocOperation(doc._id, doc._rev, doc) ];
 
         // 2. Update the document revisions list
         const [genS, hash] = doc._rev.split('-');
-        const treeKey = makeKey(this.prefix.revs, doc._id, doc._rev)
         let leaves: Leaves = { open_revs: [doc._rev] };
         if (newEdits) {
-            ops.push({
-                type: 'put',
-                key: treeKey,
-                value: JSON.stringify({
-                    start: 1,
-                    ids: [hash]
-                })
-            });
+            ops.push(this.storeRevsOperation(doc._id, doc._rev, 1, [hash]));
         } else {
-            ops.push({
-                type: 'put',
-                key: treeKey,
-                value: JSON.stringify({
-                    start: parseInt(genS),
-                    ids: doc._revisions.ids
-                })
-            });
-
-            let currentLeaves: Leaves;
+            ops.push(this.storeRevsOperation(doc._id, doc._rev, parseInt(genS), doc._revisions.ids));
             try {
-                currentLeaves = await this.openRevs(doc._id);
+                const currentLeaves = await this.getLeaves(doc._id);
+                leaves.open_revs = leaves.open_revs.concat(currentLeaves.open_revs);
             } catch (err) {
                 throw err;
             }
-            leaves.open_revs = leaves.open_revs.concat(currentLeaves.open_revs);
         }
 
-        ops.push({
-            type: 'put',
-            key:  makePrefixedKey(this.prefix.leaves, doc._id),
-            value: JSON.stringify(leaves)
-        });
+        // 3. Update the list of open leaves
+        ops.push(this.storeLeavesOperation(doc._id, leaves));
 
         return ops;
     }
@@ -309,8 +270,8 @@ export class StefDB {
     }
 
     public async bulkWrite(docs: Document[], newEdits: boolean = true): Promise<DocumentMeta[]> {
-        let statements = [] as BulkOperation[];
-        let response = [] as DocumentMeta[];
+        let statements: BulkOperation[] = [];
+        let response: DocumentMeta[] = [];
         for (const doc of docs) {
             let ops: BulkOperation[] = [];
             try {
@@ -322,10 +283,7 @@ export class StefDB {
             for (const op of ops) {
                 const [prefix, id, rev] = op.key.split('!');
                 if (prefix === this.prefix.doc) {
-                    response.push({
-                        id: id,
-                        rev: rev
-                    });
+                    response.push({id: id, rev: rev});
                 }
             }
             statements = statements.concat(ops);
@@ -352,41 +310,60 @@ export class StefDB {
     }
 
     public async read(metaOrID: DocumentMeta | string): Promise<Document> {
-        let key: string;
+        let id: string;
+        let rev: string;
         if (typeof metaOrID === "string") {
-            let winningRev = await this.winner(metaOrID);
+            id = metaOrID;
             try {
-                winningRev = await this.winner(metaOrID);
+                rev = await this.winner(metaOrID);
             } catch (err) {
                 throw err;
             }
-            key = makeKey(this.prefix.doc, metaOrID, winningRev);
         } else {
-            key = makeKey(this.prefix.doc, metaOrID.id, metaOrID.rev);
+            id = metaOrID.id;
+            rev = metaOrID.rev;
         }
 
         try {
-            return JSON.parse(await this.db.get(key) as any).body;
+            return (await this.getNode(id, rev)).body;
         } catch (err) {
             throw err;
         }
     }
 
-    public async openRevs(id: string): Promise<Leaves> {
+    private async isLeaf(id: string, rev: string): Promise<boolean> {
+        try {
+            const node = await this.getNode(id, rev);
+            return node.leaf;
+        } catch (err) {
+            throw err;
+        }
+    }
+
+    private async getNode(id: string, rev: string): Promise<Node> {
+        const docKey = makeKey(this.prefix.doc, id, rev);
+        try {
+            return JSON.parse(await this.db.get(docKey));
+        } catch (err) {
+            throw new Error(`[getNode] key not found: {id:${id}, rev:${rev}}`);
+        }
+    }
+
+    public async getLeaves(id: string): Promise<Leaves> {
         const key = makePrefixedKey(this.prefix.leaves, id);
         try {
             return JSON.parse(await this.db.get(key));
         } catch (err) {
-            throw new Error(`[openRevs] key not found: ${key}`);
+            throw new Error(`[getLeaves] key not found: ${id}`);
         }
     }
 
-    public async getRevisions(meta: DocumentMeta): Promise<Revisions> {
-        const key = makeKey(this.prefix.revs, meta.id, meta.rev);
+    public async getRevisions(id: string, rev: string): Promise<Revisions> {
+        const key = makeKey(this.prefix.revs, id, rev);
         try {
             return JSON.parse(await this.db.get(key));
         } catch (err) {
-            throw new Error(`[getRevisions] key not found: ${key}`);
+            throw new Error(`[getRevisions] No tree structure found for {id:${id}, rev:${rev}}`);
         }
     }
 }
